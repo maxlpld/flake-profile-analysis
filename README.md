@@ -98,7 +98,3 @@ my_profiles_height_summary.csv
 ```
 
 in the same folder as the input data file.
-
-## Notes
-
-The height obtained from AFM line profiles is an apparent height. For constant-frequency-shift AFM measurements, it should be interpreted carefully and compared with literature values only as a compatibility check.
