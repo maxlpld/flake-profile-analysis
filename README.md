@@ -1,45 +1,40 @@
 # AFM Flake Profile Analysis
 
-Small Python script to analyze AFM line profiles exported from Gwyddion for an island or flake on a surface.
+Small Python script to analyze AFM/Gwyddion line profiles across an island or flake on a surface.
 
-The expected profile geometry is:
+The expected profile geometry is approximately:
 
 ```text
-terrace -> left island edge -> flake top -> right island edge -> terrace
+terrace -> left flake edge -> flake top -> right flake edge -> terrace
 ```
 
-The script detects the two island edges, estimates the apparent flake height from the left and right sides of each profile, and analyzes stripe-like oscillations on top of the flake. It can use one profile file only, or a pair of forward/backward scan files.
+The script measures the apparent height separately at the left and right edges, analyzes stripe-like oscillations on the flake top, and saves publication-style plots using the University of Basel color palette.
 
-## What the script does
+## What the script creates
 
-It creates:
+For each analysis, the script saves:
 
-- a plot of all line profiles plus the mean profile,
-- a plot of the left-edge and right-edge apparent heights for each profile, including a linear fit,
-- a plot of the stripe spacing measured on top of the flake, including a linear fit,
-- a CSV summary file with the numerical results.
-
-The plots use the University of Basel color palette.
+- a mean-profile plot showing all line profiles, the mean profile, the detected left/right edge markers, and the fitted left/right heights,
+- either a separate apparent-height plot or the same height plot as an inset in the mean-profile plot,
+- a stripe-spacing plot,
+- a CSV summary file with the numerical values.
 
 ## Input data
 
-Provide one or two text/CSV files exported from the Gwyddion profile graph.
-
-The file should contain several line profiles, ideally 5 or more, exported with columns such as:
+Use one or two text files exported from a Gwyddion graph/profile window. The file should contain line profiles in pairs of columns, for example:
 
 ```text
 x1, z1, x2, z2, x3, z3, ...
 ```
 
-or the standard Gwyddion graph export format. Distances and heights can be in `m`, `nm`, `µm`, or `Å`; the script converts them to nm.
+The standard Gwyddion graph export format is also supported. The script accepts distances and heights in `m`, `nm`, `µm`, or `Å` and converts everything to nm.
 
-Each profile should cross the same type of feature in this order:
+You can provide:
 
-```text
-bare terrace -> first island edge -> flake top -> second island edge -> bare terrace
-```
+- one forward profile file only, or
+- one forward and one backward profile file.
 
-When both forward and backward files are provided, the script calculates the left-edge height from both scan directions and averages them. The same is done for the right-edge height. This is useful when one scan direction gives a cleaner edge response than the other.
+When both forward and backward files are provided, the script computes the left-edge and right-edge heights for each scan direction and averages the corresponding values for each profile index. The error bars in the height plot are the standard deviation between the available scan-direction values.
 
 ## Installation
 
@@ -47,55 +42,99 @@ When both forward and backward files are provided, the script calculates the lef
 pip install numpy matplotlib
 ```
 
-The other imported modules are part of the Python standard library.
+The other modules used by the script are part of the Python standard library.
 
 ## Usage
 
 Interactive mode:
 
 ```bash
-python flake_analysis.py
+python3 flake_analysis.py
 ```
-
-The script will ask for:
-
-- the path to the forward Gwyddion profile data file,
-- optionally, the path to the backward Gwyddion profile data file,
-- whether to use a transparent background,
-- whether to add titles to the plots,
-- whether to show profile legends for each plot.
 
 Command-line mode with one file:
 
 ```bash
-python flake_analysis.py --forward-data /path/to/forward_profiles.txt
-```
-
-or, using the backward-compatible alias:
-
-```bash
-python flake_analysis.py --data /path/to/forward_profiles.txt
+python3 flake_analysis.py --forward-data /path/to/forward_profiles.txt
 ```
 
 Command-line mode with forward and backward files:
 
 ```bash
-python flake_analysis.py \
+python3 flake_analysis.py \
   --forward-data /path/to/forward_profiles.txt \
   --backward-data /path/to/backward_profiles.txt
 ```
 
-Transparent background:
+Put the apparent-height plot as an inset in the mean-profile plot:
 
 ```bash
-python flake_analysis.py --forward-data /path/to/forward_profiles.txt --transparent yes
+python3 flake_analysis.py \
+  --forward-data /path/to/forward_profiles.txt \
+  --backward-data /path/to/backward_profiles.txt \
+  --height-inset yes
+```
+
+Use a transparent background:
+
+```bash
+python3 flake_analysis.py --forward-data /path/to/forward_profiles.txt --transparent yes
 ```
 
 Use external LaTeX rendering if LaTeX is installed:
 
 ```bash
-python flake_analysis.py --forward-data /path/to/forward_profiles.txt --usetex
+python3 flake_analysis.py --forward-data /path/to/forward_profiles.txt --usetex
 ```
+
+## How the edge heights are computed
+
+The current height detection does **not** use a threshold-based plateau average. Instead, it follows the edge directly from the profile endpoint.
+
+For the **left edge**:
+
+1. Start from the first available point of the profile.
+2. Move point by point to the right.
+3. Track the last point where the height was still increasing.
+4. When the next `EDGE_DECREASE_RUN` points decrease, the last increasing point is selected as the left-edge maximum.
+5. The left height is then computed as
+
+   ```text
+   h_left = |z(left maximum) - z(first point)|
+   ```
+
+For the **right edge**:
+
+1. Start from the last available point of the profile.
+2. Move point by point to the left.
+3. Apply the same rule in the reversed direction.
+4. The selected maximum is marked with a triangle.
+5. The right height is computed as
+
+   ```text
+   h_right = |z(right maximum) - z(last point)|
+   ```
+
+On the mean-profile plot, the left-edge maxima are shown with circle markers and the right-edge maxima with triangle markers. These are the same points used to compute the values shown in the apparent-height plot.
+
+## Adjustable parameter
+
+At the top of `flake_analysis.py`, the only user-adjustable height-detection parameter is:
+
+```python
+EDGE_DECREASE_RUN = 3
+```
+
+This controls how many consecutive decreasing points are required after the edge maximum before the code accepts that maximum.
+
+- Increase it, for example to `4` or `5`, if the data are noisy and the edge is detected too early.
+- Decrease it, for example to `2`, if the edge is very sharp or if the code misses the local edge maximum.
+
+A value of `3` is a good default for moderately noisy AFM line profiles.
+
+## Stripe-spacing analysis
+
+The stripe-spacing plot is still computed from peaks detected on the flake top. The script first detects the flake region, subtracts a slow background from the top region, finds local maxima, and computes the peak-to-peak distances. Forward and backward spacings are shown with different markers to avoid confusion with the left/right height markers.
 
 ## Output files
 
@@ -105,7 +144,7 @@ For an input file named:
 my_profiles.txt
 ```
 
-the script saves:
+the script saves files such as:
 
 ```text
 my_profiles_profiles_mean_height.png
@@ -116,45 +155,11 @@ my_profiles_height_summary.csv
 
 If both forward and backward files are provided, the output base name contains `_forward_backward`.
 
-## Height and error calculation
-
-For each line profile, the apparent left-edge height is calculated as the difference between the mean height of the flake plateau and the mean height of the terrace near the left edge:
-
-$$
-h_i^\mathrm{L} = \langle z_\mathrm{flake,L} \rangle - \langle z_\mathrm{terrace,L} \rangle .
-$$
-
-The right-edge height is calculated analogously:
-
-$$
-h_i^\mathrm{R} = \langle z_\mathrm{flake,R} \rangle - \langle z_\mathrm{terrace,R} \rangle .
-$$
-
-If both forward and backward scans are provided, the displayed value for each edge is the mean of the available scan-direction values:
-
-$$
-\bar{h}_i = \frac{1}{n_i}\sum_{k=1}^{n_i} h_{i,k} .
-$$
-
-The error bar is the sample standard deviation:
-
-$$
-s_i = \sqrt{\frac{1}{n_i-1}\sum_{k=1}^{n_i}\left(h_{i,k}-\bar{h}_i\right)^2} .
-$$
-
-If only one value is available, the error bar is set to zero. The same convention is used for stripe-spacing error bars, where the values are the peak-to-peak distances detected on the flake top.
-
-The linear fits in the height and stripe-spacing plots use:
-
-$$
-y(i)=a i+b,
-$$
-
-where `i` is the profile index. The uncertainties displayed for `a` and `b` are the standard errors obtained from the least-squares covariance matrix.
+If `--height-inset yes` is used, the apparent-height plot is included inside the mean-profile plot and the separate `_left_right_heights.png` plot is not saved.
 
 ## Example output
 
-Place example images in an `examples/` folder and reference them from the README like this:
+Place example images in the `examples/` folder:
 
 ```text
 examples/20260428_MOS2-Ag(111)0005_data_height_forward_backward_profiles_mean_height.png
@@ -162,11 +167,11 @@ examples/20260428_MOS2-Ag(111)0005_data_height_forward_backward_left_right_heigh
 examples/20260428_MOS2-Ag(111)0005_data_height_forward_backward_stripe_spacing.png
 ```
 
-Mean profile and apparent height:
+Mean profile with height inset:
 
-![Mean profile and apparent height](examples/20260428_MOS2-Ag(111)0005_data_height_forward_backward_profiles_mean_height.png)
+![Mean profile and height inset](examples/20260428_MOS2-Ag(111)0005_data_height_forward_backward_profiles_mean_height.png)
 
-Left-edge and right-edge apparent heights:
+Left and right apparent heights:
 
 ![Left and right edge heights](examples/20260428_MOS2-Ag(111)0005_data_height_forward_backward_left_right_heights.png)
 

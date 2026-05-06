@@ -15,11 +15,10 @@ import matplotlib.pyplot as plt
 from matplotlib.lines import Line2D
 
 
-SMOOTH_WINDOW_FRACTION = 0.05
-MIN_SMOOTH_WINDOW_POINTS = 5
-THRESHOLD_FRACTION = 0.30
-EDGE_MARGIN_NM = 0.30
-AVERAGING_WINDOW_NM = 1.20
+# Only user-adjustable height-detection parameter.
+# Number of consecutive decreasing points required after the edge maximum.
+EDGE_DECREASE_RUN = 3
+
 ERROR_BAR_MODE = "std"
 
 UNIBAS = {
@@ -54,6 +53,10 @@ class HeightResult:
     height_right_nm: float
     height_left_err_nm: float = 0.0
     height_right_err_nm: float = 0.0
+    left_marker_x_nm: float = np.nan
+    left_marker_z_nm: float = np.nan
+    right_marker_x_nm: float = np.nan
+    right_marker_z_nm: float = np.nan
 
 
 @dataclass
@@ -84,6 +87,7 @@ def parse_args():
     parser.add_argument("--forward-data", type=str, default=None, help="Path to the forward Gwyddion profile data file.")
     parser.add_argument("--backward-data", type=str, default=None, help="Optional path to the backward Gwyddion profile data file.")
     parser.add_argument("--transparent", type=str, default=None, help="yes/no for transparent plot background.")
+    parser.add_argument("--height-inset", type=str, default=None, help="yes/no: put the height plot as an inset in the profile plot.")
     parser.add_argument("--usetex", action="store_true", help="Use external LaTeX installation for text rendering.")
     return parser.parse_args()
 
@@ -142,6 +146,12 @@ def ask_transparent(arg_value=None) -> bool:
     if arg_value is not None:
         return yes_no(arg_value)
     return ask("Transparent background? [Y/n]: ")
+
+
+def ask_height_inset(arg_value=None) -> bool:
+    if arg_value is not None:
+        return yes_no(arg_value)
+    return ask("Put the apparent-height plot as an inset in the mean-profile plot? [Y/n]: ")
 
 
 def sniff_delimiter(first_line):
@@ -215,8 +225,6 @@ def read_profiles(path):
             z = z[order]
             x = x - x[0]
 
-            profile_name = names[col].strip() if col < len(names) and names[col].strip() else f"Profile {len(profiles)+1}"
-
             profiles.append(Profile(
                 name=f"Profile {len(profiles)+1}",
                 x_nm=x,
@@ -248,16 +256,16 @@ def moving_average(y, window):
 
 
 def detect_edges(profile):
+    """Threshold-based flake region detection used only for stripe spacing."""
     z = profile.z_nm
     n = len(z)
 
-    window = max(MIN_SMOOTH_WINDOW_POINTS, int(SMOOTH_WINDOW_FRACTION * n))
+    window = max(5, int(0.05 * n))
     z_s = moving_average(z, window)
 
     low = np.percentile(z_s, 15)
     high = np.percentile(z_s, 85)
-
-    threshold = low + THRESHOLD_FRACTION * (high - low)
+    threshold = low + 0.30 * (high - low)
 
     mask = z_s > threshold
     idx = np.where(mask)[0]
@@ -268,32 +276,82 @@ def detect_edges(profile):
     return idx[0], idx[-1]
 
 
-def mean_window(x, z, a, b):
-    m = (x >= a) & (x <= b)
-    if np.sum(m) < 2:
-        return np.nan
-    return float(np.nanmean(z[m]))
+def detect_edge_height_from_endpoint(profile, side):
+    """Detect one edge height from one endpoint using the requested rule.
 
+    Left edge:
+        start from the first available point and move to the right. The selected
+        point is the last point reached while the profile was increasing before
+        EDGE_DECREASE_RUN consecutive decreases are observed.
 
-def analyze_height(profile):
-    left_idx, right_idx = detect_edges(profile)
+    Right edge:
+        start from the last available point and move to the left. The same rule
+        is applied in the reversed scan direction.
+
+    The height is |z(selected point) - z(endpoint)| and the marker is placed on
+    the selected point used for this height measurement.
+    """
+    if side not in {"left", "right"}:
+        raise ValueError("side must be 'left' or 'right'")
 
     x = profile.x_nm
     z = profile.z_nm
+    finite = np.isfinite(x) & np.isfinite(z)
+    idx = np.where(finite)[0]
 
-    xl = x[left_idx]
-    xr = x[right_idx]
+    if len(idx) < EDGE_DECREASE_RUN + 2:
+        return np.nan, np.nan, np.nan
 
-    z_left_terrace = mean_window(x, z, max(x[0], xl - EDGE_MARGIN_NM - AVERAGING_WINDOW_NM), xl - EDGE_MARGIN_NM)
-    z_left_flake = mean_window(x, z, xl + EDGE_MARGIN_NM, min(x[-1], xl + EDGE_MARGIN_NM + AVERAGING_WINDOW_NM))
+    if side == "right":
+        idx = idx[::-1]
 
-    z_right_flake = mean_window(x, z, max(x[0], xr - EDGE_MARGIN_NM - AVERAGING_WINDOW_NM), xr - EDGE_MARGIN_NM)
-    z_right_terrace = mean_window(x, z, xr + EDGE_MARGIN_NM, min(x[-1], xr + EDGE_MARGIN_NM + AVERAGING_WINDOW_NM))
+    base_idx = int(idx[0])
+    z_scan = z[idx]
+
+    last_increasing_pos = None
+    selected_pos = None
+
+    for pos in range(1, len(idx)):
+        if z_scan[pos] > z_scan[pos - 1]:
+            last_increasing_pos = pos
+
+        if last_increasing_pos is None:
+            continue
+
+        j = last_increasing_pos
+        if j + EDGE_DECREASE_RUN < len(idx):
+            after_max = z_scan[j:j + EDGE_DECREASE_RUN + 1]
+            if np.all(np.diff(after_max) < 0):
+                selected_pos = j
+                break
+
+    if selected_pos is None:
+        # Fallback: if no complete decreasing run is found, use the last point
+        # that was part of the initial increase.  This avoids jumping to the
+        # opposite edge of the flake.
+        if last_increasing_pos is not None:
+            selected_pos = last_increasing_pos
+        else:
+            selected_pos = int(np.nanargmax(z_scan))
+
+    max_idx = int(idx[selected_pos])
+    height = abs(float(z[max_idx]) - float(z[base_idx]))
+
+    return height, float(x[max_idx]), float(z[max_idx])
+
+
+def analyze_height(profile):
+    left_h, left_marker_x, left_marker_z = detect_edge_height_from_endpoint(profile, side="left")
+    right_h, right_marker_x, right_marker_z = detect_edge_height_from_endpoint(profile, side="right")
 
     return HeightResult(
-        profile.name,
-        z_left_flake - z_left_terrace,
-        z_right_flake - z_right_terrace
+        profile=profile.name,
+        height_left_nm=left_h,
+        height_right_nm=right_h,
+        left_marker_x_nm=left_marker_x,
+        left_marker_z_nm=left_marker_z,
+        right_marker_x_nm=right_marker_x,
+        right_marker_z_nm=right_marker_z,
     )
 
 
@@ -440,7 +498,6 @@ def height_stats(results):
     return mean_h, err_h, std_h, values
 
 
-
 def linear_fit_with_errors(x_values, y_values):
     x = np.asarray(x_values, dtype=float)
     y = np.asarray(y_values, dtype=float)
@@ -473,31 +530,246 @@ def linear_fit_with_errors(x_values, y_values):
 
     return slope, intercept, slope_err, intercept_err
 
-def plot_profiles(forward_profiles, backward_profiles, mean_h, err_h, out, transparent, show_legend, title):
-    fig, ax = plt.subplots(figsize=(7, 4.5))
+
+def side_fit_values(results, side):
+    fit_x_values = []
+    fit_y_values = []
+
+    if side not in {"left", "right"}:
+        raise ValueError("side must be 'left' or 'right'")
+
+    for i, r in enumerate(results, start=1):
+        value = r.height_left_nm if side == "left" else r.height_right_nm
+        if np.isfinite(value):
+            fit_x_values.append(float(i))
+            fit_y_values.append(float(value))
+
+    return np.asarray(fit_x_values, dtype=float), np.asarray(fit_y_values, dtype=float)
+
+
+def side_fit_with_errors(results, side):
+    fit_x_values, fit_y_values = side_fit_values(results, side=side)
+    return linear_fit_with_errors(fit_x_values, fit_y_values)
+
+
+def draw_height_panel(ax, results, show_profile_legend=False, title=None, outside_text=False, outside_profile_legend=False, compact=False):
+    handles = []
+    left_dx = -0.08
+    right_dx = 0.08
+
+    left_fit_x_values = []
+    left_fit_y_values = []
+    right_fit_x_values = []
+    right_fit_y_values = []
+
+    for i, r in enumerate(results, start=1):
+        color = PROFILE_COLORS[(i-1) % len(PROFILE_COLORS)]
+
+        if np.isfinite(r.height_left_nm):
+            ax.errorbar(
+                i + left_dx,
+                r.height_left_nm,
+                yerr=r.height_left_err_nm,
+                fmt="o",
+                color=color,
+                capsize=3 if compact else 4,
+                markersize=5 if compact else 7
+            )
+            left_fit_x_values.append(float(i))
+            left_fit_y_values.append(float(r.height_left_nm))
+
+        if np.isfinite(r.height_right_nm):
+            ax.errorbar(
+                i + right_dx,
+                r.height_right_nm,
+                yerr=r.height_right_err_nm,
+                fmt="^",
+                color=color,
+                capsize=3 if compact else 4,
+                markersize=5 if compact else 7
+            )
+            right_fit_x_values.append(float(i))
+            right_fit_y_values.append(float(r.height_right_nm))
+
+        if np.isfinite(r.height_left_nm) and np.isfinite(r.height_right_nm):
+            ax.plot(
+                [i + left_dx, i + right_dx],
+                [r.height_left_nm, r.height_right_nm],
+                color=color,
+                alpha=0.7,
+                lw=1.0 if compact else 1.2,
+            )
+
+        handles.append(Line2D([0], [0], color=color, lw=1.5, label=r.profile))
+
+    left_slope, left_intercept, left_slope_err, left_intercept_err = linear_fit_with_errors(
+        np.asarray(left_fit_x_values, dtype=float), np.asarray(left_fit_y_values, dtype=float)
+    )
+    right_slope, right_intercept, right_slope_err, right_intercept_err = linear_fit_with_errors(
+        np.asarray(right_fit_x_values, dtype=float), np.asarray(right_fit_y_values, dtype=float)
+    )
+
+    fit_handles = []
+    text_lines = []
+    fit_x = np.linspace(1, len(results), 200)
+
+    if np.isfinite(left_slope) and np.isfinite(left_intercept):
+        ax.plot(fit_x, left_slope * fit_x + left_intercept, color="black", lw=1.5 if compact else 2, linestyle="-")
+        fit_handles.append(Line2D([0], [0], color="black", lw=2, linestyle="-", label=r"Left fit"))
+        text_lines.extend([
+            rf"$h_\mathrm{{left}}(i)=a_L i+b_L$",
+            rf"$a_L={left_slope:.4f} \pm {left_slope_err:.4f}\,\mathrm{{nm}}$",
+            rf"$b_L={left_intercept:.4f} \pm {left_intercept_err:.4f}\,\mathrm{{nm}}$",
+        ])
+
+    if np.isfinite(right_slope) and np.isfinite(right_intercept):
+        ax.plot(fit_x, right_slope * fit_x + right_intercept, color="black", lw=1.5 if compact else 2, linestyle="--")
+        fit_handles.append(Line2D([0], [0], color="black", lw=2, linestyle="--", label=r"Right fit"))
+        if text_lines:
+            text_lines.append("")
+        text_lines.extend([
+            rf"$h_\mathrm{{right}}(i)=a_R i+b_R$",
+            rf"$a_R={right_slope:.4f} \pm {right_slope_err:.4f}\,\mathrm{{nm}}$",
+            rf"$b_R={right_intercept:.4f} \pm {right_intercept_err:.4f}\,\mathrm{{nm}}$",
+        ])
+
+    ax.set_xlabel(r"Profile index", fontsize=8 if compact else None)
+    ax.set_ylabel(r"Apparent height $h$ (nm)", fontsize=8 if compact else None)
+    ax.set_xticks(list(range(1, len(results)+1)))
+    ax.set_xticklabels([str(i) for i in range(1, len(results)+1)], fontsize=7 if compact else None)
+    ax.set_xlim(0.5, len(results) + 0.5)
+    ax.tick_params(axis="y", labelsize=7 if compact else None)
+
+    if title:
+        ax.set_title(title)
+
+    ax.grid(False)
+
+    marker_notes = [
+        Line2D([0], [0], color="none", marker="o", markerfacecolor="none", markeredgecolor=UNIBAS["anthrazit"], label=r"Left edge"),
+        Line2D([0], [0], color="none", marker="^", markerfacecolor="none", markeredgecolor=UNIBAS["anthrazit"], label=r"Right edge"),
+    ]
+
+    fit_legend_handles = fit_handles if compact else fit_handles + marker_notes
+    if fit_legend_handles:
+        # In the standalone height plot, keep the marker meaning together with
+        # the fit-line meaning in the lower-left legend.  In the inset, the
+        # marker meaning is already shown in the main plot legend, so the inset
+        # only keeps the compact left/right-fit legend.
+        fit_legend = ax.legend(
+            handles=fit_legend_handles,
+            frameon=False,
+            fontsize=7 if compact else 8,
+            loc="lower left",
+        )
+        ax.add_artist(fit_legend)
+
+    if show_profile_legend:
+        legend_handles = handles
+        if outside_profile_legend:
+            ax.legend(
+                handles=legend_handles,
+                frameon=False,
+                fontsize=8,
+                ncol=2,
+                loc="lower left",
+                bbox_to_anchor=(1.02, 0.02),
+                borderaxespad=0.0,
+            )
+        else:
+            ax.legend(handles=legend_handles, frameon=False, fontsize=8, ncol=2)
+
+    if text_lines and not compact:
+        if outside_text:
+            ax.text(
+                1.02,
+                0.98,
+                "\n".join(text_lines),
+                transform=ax.transAxes,
+                ha="left",
+                va="top",
+                bbox=dict(boxstyle="round", facecolor="white", alpha=0.85),
+            )
+        else:
+            ax.text(
+                0.97,
+                0.97,
+                "\n".join(text_lines),
+                transform=ax.transAxes,
+                ha="right",
+                va="top",
+                bbox=dict(boxstyle="round", facecolor="white", alpha=0.75),
+            )
+
+    return (
+        left_slope,
+        left_intercept,
+        left_slope_err,
+        left_intercept_err,
+        right_slope,
+        right_intercept,
+        right_slope_err,
+        right_intercept_err,
+    )
+
+
+def plot_profiles(forward_profiles, backward_profiles, results, display_left_h, display_left_err_h, display_right_h, display_right_err_h, out, transparent, show_legend, title, height_inset=False):
+    fig, ax = plt.subplots(figsize=(8.8, 5.2 if height_inset else 4.5))
+
+    def add_height_markers(profile, color):
+        try:
+            result = analyze_height(profile)
+        except Exception:
+            return
+
+        if np.isfinite(result.left_marker_x_nm) and np.isfinite(result.left_marker_z_nm):
+            ax.scatter(
+                result.left_marker_x_nm,
+                result.left_marker_z_nm,
+                marker="o",
+                s=22,
+                color=color,
+                edgecolors="none",
+                zorder=5,
+            )
+
+        if np.isfinite(result.right_marker_x_nm) and np.isfinite(result.right_marker_z_nm):
+            ax.scatter(
+                result.right_marker_x_nm,
+                result.right_marker_z_nm,
+                marker="^",
+                s=28,
+                color=color,
+                edgecolors="none",
+                zorder=5,
+            )
 
     for i, p in enumerate(forward_profiles):
+        color = PROFILE_COLORS[i % len(PROFILE_COLORS)]
         ax.plot(
             p.x_nm,
             p.z_nm,
-            color=PROFILE_COLORS[i % len(PROFILE_COLORS)],
+            color=color,
             lw=1.2,
             alpha=0.7,
             linestyle="-",
             label=p.name
         )
+        add_height_markers(p, color)
 
     if backward_profiles:
         for i, p in enumerate(backward_profiles):
+            color = PROFILE_COLORS[i % len(PROFILE_COLORS)]
             ax.plot(
                 p.x_nm,
                 p.z_nm,
-                color=PROFILE_COLORS[i % len(PROFILE_COLORS)],
+                color=color,
                 lw=1.2,
                 alpha=0.7,
                 linestyle="--",
                 label="_nolegend_"
             )
+            add_height_markers(p, color)
 
     profiles_for_mean = list(forward_profiles) + (list(backward_profiles) if backward_profiles else [])
     x_mean, z_mean = common_mean_profile(profiles_for_mean)
@@ -510,7 +782,6 @@ def plot_profiles(forward_profiles, backward_profiles, mean_h, err_h, out, trans
         label="Mean profile"
     )
 
-    # Force the full x-axis to include the longest profile from both scan directions.
     ax.set_xlim(
         min(float(p.x_nm[0]) for p in profiles_for_mean),
         max(float(p.x_nm[-1]) for p in profiles_for_mean)
@@ -522,22 +793,44 @@ def plot_profiles(forward_profiles, backward_profiles, mean_h, err_h, out, trans
     if title:
         ax.set_title(title)
 
+    text_lines = []
+    if np.isfinite(display_left_h):
+        text_lines.append(rf"$h_\mathrm{{left}} = {display_left_h:.3f} \pm {display_left_err_h:.3f}\,\mathrm{{nm}}$")
+    if np.isfinite(display_right_h):
+        text_lines.append(rf"$h_\mathrm{{right}} = {display_right_h:.3f} \pm {display_right_err_h:.3f}\,\mathrm{{nm}}$")
+    if not text_lines:
+        text_lines.append(r"$h_\mathrm{left},h_\mathrm{right} = \mathrm{nan}$")
+
     ax.text(
-        0.03,
+        0.97,
         0.95,
-        rf"$h = {mean_h:.3f} \pm {err_h:.3f}\,\mathrm{{nm}}$",
+        "\n".join(text_lines),
         transform=ax.transAxes,
+        ha="right",
         va="top",
-        bbox=dict(boxstyle="round", facecolor="white", alpha=0.7)
+        bbox=dict(boxstyle="round", facecolor="white", alpha=0.85)
     )
 
     ax.grid(False)
 
+    height_fit_values = (np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan)
+    if height_inset:
+        inset_ax = ax.inset_axes([0.23, 0.08, 0.54, 0.35])
+        inset_ax.set_facecolor((1, 1, 1, 0.88))
+        height_fit_values = draw_height_panel(inset_ax, results, compact=True)
+
     if show_legend:
         handles, labels = ax.get_legend_handles_labels()
 
-        # Explain the line-style convention used when both scan directions are plotted:
-        # solid lines correspond to the forward scan, dashed lines to the backward scan.
+        marker_handles = [
+            Line2D([0], [0], color="none", marker="o", markerfacecolor="none",
+                   markeredgecolor=UNIBAS["anthrazit"], linestyle="None", label="Left edge marker"),
+            Line2D([0], [0], color="none", marker="^", markerfacecolor="none",
+                   markeredgecolor=UNIBAS["anthrazit"], linestyle="None", label="Right edge marker"),
+        ]
+        handles = handles + marker_handles
+        labels = labels + [h.get_label() for h in marker_handles]
+
         if backward_profiles:
             style_handles = [
                 Line2D([0], [0], color=UNIBAS["anthrazit"], lw=1.5, linestyle="-", label="Forward scan"),
@@ -546,124 +839,41 @@ def plot_profiles(forward_profiles, backward_profiles, mean_h, err_h, out, trans
             handles = handles + style_handles
             labels = labels + [h.get_label() for h in style_handles]
 
-        ax.legend(handles=handles, labels=labels, frameon=False, fontsize=8)
+        ax.legend(
+            handles=handles,
+            labels=labels,
+            frameon=False,
+            fontsize=8,
+            loc="lower left",
+            bbox_to_anchor=(1.02, 0.02),
+            borderaxespad=0.0,
+        )
 
     fig.tight_layout()
     fig.savefig(out, transparent=transparent, bbox_inches="tight")
     plt.close(fig)
 
+    return height_fit_values
 
-def plot_heights(results, mean_h, err_h, out, transparent, show_legend, title, has_backward=False):
-    fig, ax = plt.subplots(figsize=(7, 4.5))
 
-    handles = []
-    left_dx = -0.08 if has_backward else 0.0
-    right_dx = 0.08
+def plot_heights(results, out, transparent, show_legend, title):
+    fig, ax = plt.subplots(figsize=(8.9, 4.5))
 
-    fit_x_values = []
-    fit_y_values = []
-
-    for i, r in enumerate(results, start=1):
-        color = PROFILE_COLORS[(i-1) % len(PROFILE_COLORS)]
-
-        if np.isfinite(r.height_left_nm):
-            ax.errorbar(
-                i + left_dx,
-                r.height_left_nm,
-                yerr=r.height_left_err_nm,
-                fmt="o",
-                color=color,
-                capsize=4,
-                markersize=7
-            )
-            fit_x_values.append(float(i))
-            fit_y_values.append(float(r.height_left_nm))
-
-        if has_backward and np.isfinite(r.height_right_nm):
-            ax.errorbar(
-                i + right_dx,
-                r.height_right_nm,
-                yerr=r.height_right_err_nm,
-                fmt="^",
-                color=color,
-                capsize=4,
-                markersize=7
-            )
-            fit_x_values.append(float(i))
-            fit_y_values.append(float(r.height_right_nm))
-
-        if has_backward and np.isfinite(r.height_left_nm) and np.isfinite(r.height_right_nm):
-            ax.plot(
-                [i + left_dx, i + right_dx],
-                [r.height_left_nm, r.height_right_nm],
-                color=color,
-                alpha=0.7
-            )
-
-        handles.append(
-            Line2D([0], [0], color=color, lw=1.5, label=r.profile)
-        )
-
-    fit_x_values = np.asarray(fit_x_values, dtype=float)
-    fit_y_values = np.asarray(fit_y_values, dtype=float)
-
-    slope, intercept, slope_err, intercept_err = linear_fit_with_errors(fit_x_values, fit_y_values)
-    fit_handle = None
-
-    if np.isfinite(slope) and np.isfinite(intercept):
-        fit_x = np.linspace(1, len(results), 200)
-        fit_y = slope * fit_x + intercept
-
-        ax.plot(fit_x, fit_y, color="black", lw=2)
-        fit_handle = Line2D([0], [0], color="black", lw=2, label=r"Linear fit")
-
-        text = (
-            rf"$h(i)=a\,i+b$" + "\n" +
-            rf"$a={slope:.4f} \pm {slope_err:.4f}\,\mathrm{{nm}}$" + "\n" +
-            rf"$b={intercept:.4f} \pm {intercept_err:.4f}\,\mathrm{{nm}}$"
-        )
-
-        ax.text(
-            0.03,
-            0.95,
-            text,
-            transform=ax.transAxes,
-            va="top",
-            bbox=dict(boxstyle="round", facecolor="white", alpha=0.7)
-        )
-
-    ax.set_xlabel(r"Profile index")
-    ax.set_ylabel(r"Apparent height $h$ (nm)")
-
-    ax.set_xticks(list(range(1, len(results)+1)))
-    ax.set_xticklabels([str(i) for i in range(1, len(results)+1)])
-    ax.set_xlim(0.5, len(results) + 0.5)
-
-    if title:
-        ax.set_title(title)
-
-    ax.grid(False)
-
-    marker_note = Line2D([0], [0], color="none", marker="o", markerfacecolor="none", markeredgecolor=UNIBAS["anthrazit"], label=r"Left edge")
-    marker_notes = [marker_note]
-
-    if has_backward:
-        marker_note_2 = Line2D([0], [0], color="none", marker="^", markerfacecolor="none", markeredgecolor=UNIBAS["anthrazit"], label=r"Right edge")
-        marker_notes.append(marker_note_2)
-
-    # Always display the marker legend. If show_legend is True,
-    # also include the profile-color legend.
-    legend_handles = handles + marker_notes if show_legend else marker_notes
-    if fit_handle is not None:
-        legend_handles.append(fit_handle)
-
-    ax.legend(handles=legend_handles, frameon=False, fontsize=8, ncol=2)
+    fit_values = draw_height_panel(
+        ax,
+        results,
+        show_profile_legend=show_legend,
+        title=title,
+        outside_text=True,
+        outside_profile_legend=True,
+        compact=False,
+    )
 
     fig.tight_layout()
     fig.savefig(out, transparent=transparent, bbox_inches="tight")
     plt.close(fig)
 
-    return slope, intercept, slope_err, intercept_err
+    return fit_values
 
 
 def plot_stripes(stripe_results, out, transparent, show_legend, title, has_backward=False):
@@ -687,7 +897,7 @@ def plot_stripes(stripe_results, out, transparent, show_legend, title, has_backw
                 x_index + left_dx,
                 r.forward_mean_spacing_nm,
                 yerr=r.forward_std_spacing_nm,
-                fmt='o',
+                fmt='s',
                 color=color,
                 capsize=4,
                 markersize=7
@@ -700,7 +910,7 @@ def plot_stripes(stripe_results, out, transparent, show_legend, title, has_backw
                 x_index + right_dx,
                 r.backward_mean_spacing_nm,
                 yerr=r.backward_std_spacing_nm,
-                fmt='^',
+                fmt='D',
                 color=color,
                 capsize=4,
                 markersize=7
@@ -756,11 +966,11 @@ def plot_stripes(stripe_results, out, transparent, show_legend, title, has_backw
 
     ax.grid(False)
 
-    marker_note = Line2D([0], [0], color="none", marker="o", markerfacecolor="none", markeredgecolor=UNIBAS["anthrazit"], label=r"Forward spacing")
+    marker_note = Line2D([0], [0], color="none", marker="s", markerfacecolor="none", markeredgecolor=UNIBAS["anthrazit"], label=r"Forward spacing")
     marker_notes = [marker_note]
 
     if has_backward:
-        marker_note_2 = Line2D([0], [0], color="none", marker="^", markerfacecolor="none", markeredgecolor=UNIBAS["anthrazit"], label=r"Backward spacing")
+        marker_note_2 = Line2D([0], [0], color="none", marker="D", markerfacecolor="none", markeredgecolor=UNIBAS["anthrazit"], label=r"Backward spacing")
         marker_notes.append(marker_note_2)
 
     legend_handles = handles + marker_notes if show_legend else marker_notes
@@ -776,7 +986,7 @@ def plot_stripes(stripe_results, out, transparent, show_legend, title, has_backw
     return slope, intercept, slope_err, intercept_err
 
 
-def save_summary_csv(path, forward_data_path, backward_data_path, results, stripe_results, mean_h, err_h, std_h, height_slope, height_intercept, height_slope_err, height_intercept_err, stripe_slope, stripe_intercept, stripe_slope_err, stripe_intercept_err):
+def save_summary_csv(path, forward_data_path, backward_data_path, results, stripe_results, mean_h, err_h, std_h, height_left_slope, height_left_intercept, height_left_slope_err, height_left_intercept_err, height_right_slope, height_right_intercept, height_right_slope_err, height_right_intercept_err, stripe_slope, stripe_intercept, stripe_slope_err, stripe_intercept_err):
     with path.open("w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
 
@@ -804,16 +1014,21 @@ def save_summary_csv(path, forward_data_path, backward_data_path, results, strip
             ])
 
         writer.writerow([])
-        writer.writerow(["height_left_source", "forward_data_left_edge"])
-        writer.writerow(["height_right_source", "backward_data_right_edge" if backward_data_path is not None else "not_used"])
+        writer.writerow(["height_left_source", "endpoint_scan_left"])
+        writer.writerow(["height_right_source", "endpoint_scan_right"])
         writer.writerow(["global_mean_height_nm", f"{mean_h:.8g}" if np.isfinite(mean_h) else "nan"])
         writer.writerow([f"global_error_height_nm_{ERROR_BAR_MODE}", f"{err_h:.8g}" if np.isfinite(err_h) else "nan"])
         writer.writerow(["global_std_height_nm", f"{std_h:.8g}" if np.isfinite(std_h) else "nan"])
-        writer.writerow(["height_linear_fit_model", "h(i)=a*i+b"])
-        writer.writerow(["height_linear_fit_slope_a_nm", f"{height_slope:.8g}" if np.isfinite(height_slope) else "nan"])
-        writer.writerow(["height_linear_fit_slope_a_error_nm", f"{height_slope_err:.8g}" if np.isfinite(height_slope_err) else "nan"])
-        writer.writerow(["height_linear_fit_intercept_b_nm", f"{height_intercept:.8g}" if np.isfinite(height_intercept) else "nan"])
-        writer.writerow(["height_linear_fit_intercept_b_error_nm", f"{height_intercept_err:.8g}" if np.isfinite(height_intercept_err) else "nan"])
+        writer.writerow(["height_left_linear_fit_model", "h_left(i)=a_L*i+b_L"])
+        writer.writerow(["height_left_linear_fit_slope_a_L_nm", f"{height_left_slope:.8g}" if np.isfinite(height_left_slope) else "nan"])
+        writer.writerow(["height_left_linear_fit_slope_a_L_error_nm", f"{height_left_slope_err:.8g}" if np.isfinite(height_left_slope_err) else "nan"])
+        writer.writerow(["height_left_linear_fit_intercept_b_L_nm", f"{height_left_intercept:.8g}" if np.isfinite(height_left_intercept) else "nan"])
+        writer.writerow(["height_left_linear_fit_intercept_b_L_error_nm", f"{height_left_intercept_err:.8g}" if np.isfinite(height_left_intercept_err) else "nan"])
+        writer.writerow(["height_right_linear_fit_model", "h_right(i)=a_R*i+b_R"])
+        writer.writerow(["height_right_linear_fit_slope_a_R_nm", f"{height_right_slope:.8g}" if np.isfinite(height_right_slope) else "nan"])
+        writer.writerow(["height_right_linear_fit_slope_a_R_error_nm", f"{height_right_slope_err:.8g}" if np.isfinite(height_right_slope_err) else "nan"])
+        writer.writerow(["height_right_linear_fit_intercept_b_R_nm", f"{height_right_intercept:.8g}" if np.isfinite(height_right_intercept) else "nan"])
+        writer.writerow(["height_right_linear_fit_intercept_b_R_error_nm", f"{height_right_intercept_err:.8g}" if np.isfinite(height_right_intercept_err) else "nan"])
 
         writer.writerow([])
         writer.writerow(["Stripe spacing analysis"])
@@ -860,6 +1075,7 @@ def main():
     backward_data_path = ask_data_path(args.backward_data, label="backward", optional=True)
     has_backward = backward_data_path is not None
 
+    height_inset = ask_height_inset(args.height_inset)
     transparent = ask_transparent(args.transparent)
 
     add_titles = ask("Add titles to plots? [Y/n]: ")
@@ -885,6 +1101,21 @@ def main():
 
     mean_h, err_h, std_h, all_height_values = height_stats(results)
 
+    left_values_for_display = np.asarray([r.height_left_nm for r in results if np.isfinite(r.height_left_nm)], dtype=float)
+    right_values_for_display = np.asarray([r.height_right_nm for r in results if np.isfinite(r.height_right_nm)], dtype=float)
+
+    height_left_slope_pre, height_left_intercept_pre, height_left_slope_err_pre, height_left_intercept_err_pre = side_fit_with_errors(
+        results, side="left"
+    )
+    height_right_slope_pre, height_right_intercept_pre, height_right_slope_err_pre, height_right_intercept_err_pre = side_fit_with_errors(
+        results, side="right"
+    )
+
+    display_left_h = height_left_intercept_pre if np.isfinite(height_left_intercept_pre) else (float(np.nanmean(left_values_for_display)) if len(left_values_for_display) else np.nan)
+    display_left_err_h = height_left_intercept_err_pre if np.isfinite(height_left_intercept_err_pre) else (float(np.nanstd(left_values_for_display, ddof=1)) if len(left_values_for_display) > 1 else 0.0)
+    display_right_h = height_right_intercept_pre if np.isfinite(height_right_intercept_pre) else (float(np.nanmean(right_values_for_display)) if len(right_values_for_display) else np.nan)
+    display_right_err_h = height_right_intercept_err_pre if np.isfinite(height_right_intercept_err_pre) else (float(np.nanstd(right_values_for_display, ddof=1)) if len(right_values_for_display) > 1 else 0.0)
+
     base = forward_data_path.stem if not has_backward else f"{forward_data_path.stem}_forward_backward"
     outdir = forward_data_path.parent
 
@@ -893,27 +1124,49 @@ def main():
     stripes_plot = outdir / f"{base}_stripe_spacing.png"
     summary_csv = outdir / f"{base}_height_summary.csv"
 
-    plot_profiles(
+    height_fit_from_profile = plot_profiles(
         forward_profiles,
         backward_profiles,
-        mean_h,
-        err_h,
+        results,
+        display_left_h,
+        display_left_err_h,
+        display_right_h,
+        display_right_err_h,
         profiles_plot,
         transparent,
         legends[0],
-        titles[0]
+        titles[0],
+        height_inset=height_inset,
     )
 
-    height_slope, height_intercept, height_slope_err, height_intercept_err = plot_heights(
-        results,
-        mean_h,
-        err_h,
-        heights_plot,
-        transparent,
-        legends[1],
-        titles[1],
-        has_backward=has_backward
-    )
+    if height_inset:
+        (
+            height_left_slope,
+            height_left_intercept,
+            height_left_slope_err,
+            height_left_intercept_err,
+            height_right_slope,
+            height_right_intercept,
+            height_right_slope_err,
+            height_right_intercept_err,
+        ) = height_fit_from_profile
+    else:
+        (
+            height_left_slope,
+            height_left_intercept,
+            height_left_slope_err,
+            height_left_intercept_err,
+            height_right_slope,
+            height_right_intercept,
+            height_right_slope_err,
+            height_right_intercept_err,
+        ) = plot_heights(
+            results,
+            heights_plot,
+            transparent,
+            legends[1],
+            titles[1],
+        )
 
     stripe_slope, stripe_intercept, stripe_slope_err, stripe_intercept_err = plot_stripes(
         stripe_results,
@@ -933,10 +1186,14 @@ def main():
         mean_h,
         err_h,
         std_h,
-        height_slope,
-        height_intercept,
-        height_slope_err,
-        height_intercept_err,
+        height_left_slope,
+        height_left_intercept,
+        height_left_slope_err,
+        height_left_intercept_err,
+        height_right_slope,
+        height_right_intercept,
+        height_right_slope_err,
+        height_right_intercept_err,
         stripe_slope,
         stripe_intercept,
         stripe_slope_err,
@@ -948,7 +1205,7 @@ def main():
     if has_backward:
         print(f"Backward data file: {backward_data_path}")
     else:
-        print("Backward data file: not provided; only forward left-edge heights were used.")
+        print("Backward data file: not provided; only forward data were used.")
     print(f"Number of forward profiles: {len(forward_profiles)}")
     if has_backward:
         print(f"Number of backward profiles: {len(backward_profiles)}")
@@ -967,12 +1224,19 @@ def main():
         print(f"Backward mean stripe spacings (nm): {np.array2string(backward_stripe_means, precision=4)}")
         print(f"Backward stripe-spacing error bars (nm): {np.array2string(backward_stripe_stds, precision=4)}")
 
-    if np.isfinite(height_slope):
-        print(f"Height linear fit: h(i) = a*i + b")
-        print(f"  a = {height_slope:.4f} ± {height_slope_err:.4f} nm")
-        print(f"  b = {height_intercept:.4f} ± {height_intercept_err:.4f} nm")
+    if np.isfinite(height_left_slope):
+        print(f"Left-edge height linear fit: h_left(i) = a_L*i + b_L")
+        print(f"  a_L = {height_left_slope:.4f} ± {height_left_slope_err:.4f} nm")
+        print(f"  b_L = {height_left_intercept:.4f} ± {height_left_intercept_err:.4f} nm")
     else:
-        print("Height linear fit: not enough valid points.")
+        print("Left-edge height linear fit: not enough valid points.")
+
+    if np.isfinite(height_right_slope):
+        print(f"Right-edge height linear fit: h_right(i) = a_R*i + b_R")
+        print(f"  a_R = {height_right_slope:.4f} ± {height_right_slope_err:.4f} nm")
+        print(f"  b_R = {height_right_intercept:.4f} ± {height_right_intercept_err:.4f} nm")
+    else:
+        print("Right-edge height linear fit: not enough valid points.")
 
     if np.isfinite(stripe_slope):
         print(f"Stripe-spacing linear fit: d(i) = a*i + b")
@@ -983,7 +1247,10 @@ def main():
 
     print("\nSaved files:")
     print(f"  {profiles_plot}")
-    print(f"  {heights_plot}")
+    if height_inset:
+        print("  Apparent-height plot: included as inset in the mean-profile plot")
+    else:
+        print(f"  {heights_plot}")
     print(f"  {stripes_plot}")
     print(f"  {summary_csv}")
 
