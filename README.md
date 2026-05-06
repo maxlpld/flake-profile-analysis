@@ -173,7 +173,3 @@ Left-edge and right-edge apparent heights:
 Stripe-spacing analysis:
 
 ![Stripe-spacing analysis](examples/20260428_MOS2-Ag(111)0005_data_height_forward_backward_stripe_spacing.png)
-
-## Notes
-
-The height obtained from AFM line profiles is an apparent height. For constant-frequency-shift AFM measurements, it should be interpreted carefully and compared with literature values only as a compatibility check.
