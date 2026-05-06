@@ -54,7 +54,7 @@ The other imported modules are part of the Python standard library.
 Interactive mode:
 
 ```bash
-python flake_analysis_v6.py
+python flake_analysis.py
 ```
 
 The script will ask for:
@@ -68,19 +68,19 @@ The script will ask for:
 Command-line mode with one file:
 
 ```bash
-python flake_analysis_v6.py --forward-data /path/to/forward_profiles.txt
+python flake_analysis.py --forward-data /path/to/forward_profiles.txt
 ```
 
 or, using the backward-compatible alias:
 
 ```bash
-python flake_analysis_v6.py --data /path/to/forward_profiles.txt
+python flake_analysis.py --data /path/to/forward_profiles.txt
 ```
 
 Command-line mode with forward and backward files:
 
 ```bash
-python flake_analysis_v6.py \
+python flake_analysis.py \
   --forward-data /path/to/forward_profiles.txt \
   --backward-data /path/to/backward_profiles.txt
 ```
@@ -88,13 +88,13 @@ python flake_analysis_v6.py \
 Transparent background:
 
 ```bash
-python flake_analysis_v6.py --forward-data /path/to/forward_profiles.txt --transparent yes
+python flake_analysis.py --forward-data /path/to/forward_profiles.txt --transparent yes
 ```
 
 Use external LaTeX rendering if LaTeX is installed:
 
 ```bash
-python flake_analysis_v6.py --forward-data /path/to/forward_profiles.txt --usetex
+python flake_analysis.py --forward-data /path/to/forward_profiles.txt --usetex
 ```
 
 ## Output files
